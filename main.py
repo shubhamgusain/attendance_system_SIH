@@ -1,595 +1,319 @@
 import os
-import base64
-import datetime
-import numpy as np
-import pandas as pd
-import cv2
 from flask import Flask, render_template_string, request, redirect, url_for, session, flash, send_file, abort
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
-import mysql.connector
+from werkzeug.utils import secure_filename
+import pandas as pd
 
 app = Flask(__name__)
 app.secret_key = 'your_secret_key_here'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MODEL_PATH'] = 'models/face_recognizer.yml'
-
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-os.makedirs(os.path.dirname(app.config['MODEL_PATH']), exist_ok=True)
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
-
-# Replace with your MySQL credentials
-DB_CONFIG = {
-    'host': 'localhost',
-    'user': 'root',
-    'password': 'rishu6377',
-    'database': 'attendance_db'
-}
-
-conn = mysql.connector.connect(**DB_CONFIG)
-cursor = conn.cursor()
-cursor.execute("SELECT id, class_name, roll_no, image_data FROM face_images LIMIT 5")
-rows = cursor.fetchall()
-for id_, cls, roll, img_blob in rows:
-    filename = f"{cls}_{roll}_{id_}.jpg"
-    with open(filename, 'wb') as f:
-        f.write(img_blob)
-    print(f"Saved image: {filename}")
-cursor.close()
-conn.close()
-
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(128), nullable=False)
-    workbook_path = db.Column(db.String(256))
-
-    def set_password(self, pw):
-        self.password_hash = bcrypt.generate_password_hash(pw).decode()
-
-    def check_password(self, pw):
-        return bcrypt.check_password_hash(self.password_hash, pw)
+    role = db.Column(db.String(50), nullable=False, default='user')
+    workbook_path = db.Column(db.String(255), nullable=True)
+    def set_password(self, password):
+        self.password_hash = bcrypt.generate_password_hash(password).decode('utf-8')
+    def check_password(self, password):
+        return bcrypt.check_password_hash(self.password_hash, password)
 
 with app.app_context():
     db.create_all()
 
-def get_mysql_connection():
-    return mysql.connector.connect(**DB_CONFIG)
-
-def save_face_images(class_name, roll_no, images):
-    conn = get_mysql_connection()
-    cursor = conn.cursor()
-    for img_b64 in images:
-        if ',' in img_b64:
-            img_b64 = img_b64.split(',')[1]
-        img_bytes = base64.b64decode(img_b64)
-        cursor.execute("INSERT INTO face_images (class_name, roll_no, image_data) VALUES (%s, %s, %s)", (class_name, roll_no, img_bytes))
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-def load_face_data():
-    conn = get_mysql_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT class_name, roll_no, image_data FROM face_images")
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-
-    faces, labels, label_map = [], [], {}
-    current_label = 0
-    for c, r, img_data in rows:
-        key = f"{c}-{r}"
-        if key not in label_map:
-            label_map[key] = current_label
-            current_label += 1
-        label = label_map[key]
-        nparr = np.frombuffer(img_data, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-        if img is not None:
-            img = cv2.resize(img, (200, 200))
-            faces.append(img)
-            labels.append(label)
-    return faces, labels, label_map
-
-def train_and_save_model():
-    faces, labels, _ = load_face_data()
-    if not faces:
-        return False, "No face data available."
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
-    recognizer.train(faces, np.array(labels))
-    recognizer.write(app.config['MODEL_PATH'])
-    return True, "Model trained successfully."
-
-HOME_HTML = '''
-<!doctype html>
-<html>
-<head>
-<title>Login / Register</title>
-<style>
-  body { font-family: Arial, sans-serif; background: #eef2f7; }
-  .container { width: 300px; margin: 50px auto; background: #fff; padding: 20px; border-radius: 10px; box-shadow: 0 0 15px #aaa; }
-  h2 { text-align: center; margin-bottom: 20px; }
-  input, button { width: 100%; padding: 10px; margin: 8px 0; border-radius: 5px; border: 1px solid #ccc; font-size: 14px; }
-  button { background: #1764c7; color: white; border: none; font-weight: bold; cursor: pointer; }
-  button:hover { background: #124f91; }
-  .toggle { text-align: center; color: #1764c7; cursor: pointer; margin-top: 15px; }
-  .message { text-align: center; color: red; margin-bottom: 12px; }
-  .message.success { color: green; }
-</style>
-</head>
-<body>
-<div class="container">
-<h2 id="title">Login</h2>
-{% if error_msg %}<div class="message">{{ error_msg }}</div>{% endif %}
-{% if success_msg %}<div class="message success">{{ success_msg }}</div>{% endif %}
-<form id="login_form" method="POST">
-<input type="hidden" name="action" value="login"/>
-<input name="username" placeholder="Username" required autofocus/>
-<input type="password" name="password" placeholder="Password" required/>
-<button type="submit">Login</button>
-</form>
-<form id="register_form" method="POST" enctype="multipart/form-data" style="display:none;">
-<input type="hidden" name="action" value="register"/>
-<input name="username" placeholder="Username" required/>
-<input type="password" name="password" placeholder="Password" required/>
-<input type="password" name="password2" placeholder="Confirm Password" required/>
-<input type="file" name="workbook" accept=".xlsx" required/>
-<button type="submit">Register</button>
-</form>
-<div class="toggle" onclick="toggleForms()">Don't have an account? Register</div>
-</div>
-<script>
-function toggleForms() {
-  let loginForm = document.getElementById('login_form');
-  let regForm = document.getElementById('register_form');
-  let title = document.getElementById('title');
-  if(loginForm.style.display === 'none') {
-    loginForm.style.display = 'block';
-    regForm.style.display = 'none';
-    title.innerText = 'Login';
-  } else {
-    loginForm.style.display = 'none';
-    regForm.style.display = 'block';
-    title.innerText = 'Register';
-  }
-}
-</script>
-</body>
-</html>
-'''
-
-DASHBOARD_HTML = '''
-<!doctype html>
-<html>
-<head>
-<title>Dashboard</title>
-<style>
-  body { font-family: Arial, sans-serif; background: #eef2f7; }
-  .container { max-width: 600px; margin: 40px auto; background: #fff; padding: 25px; border-radius: 10px; box-shadow: 0 0 20px #aaa; text-align: center; }
-  h2 { margin-bottom: 20px; }
-  button, a { padding: 12px 25px; margin: 10px; font-weight: bold; border: none; border-radius: 7px; color: white; cursor: pointer; background: #1764c7; text-decoration: none; }
-  button:hover, a:hover { background: #124f91; }
-  #captureModal { display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.6); justify-content: center; align-items: center; z-index: 999; }
-  #captureModal div { background: white; padding: 20px; border-radius: 10px; }
-  input { width: 80%; padding: 8px; margin: 10px 0; border-radius: 5px; border: 1px solid #ccc; }
-  video { border-radius: 10px; margin-top: 10px; }
-</style>
-</head>
-<body>
-<div class="container">
-<h2>Welcome, {{ username }}</h2>
-<p>Uploaded Workbook: <strong>{{ workbook }}</strong></p>
-<a href="{{ url_for('download_workbook') }}">Download Workbook</a>
-<a href="{{ url_for('add_student') }}">Add Student</a>
-<button onclick="showCapture()">Capture Face</button>
-<form action="{{ url_for('train_model') }}" method="post" style="display:inline;">
-  <button type="submit">Train Model</button>
-</form>
-<a href="{{ url_for('mark_attendance') }}">Mark Attendance</a>
-<a href="{{ url_for('logout') }}">Logout</a>
-</div>
-
-<div id="captureModal">
-  <div>
-    <h3>Face Capture</h3>
-    <input type="text" id="className" placeholder="Class name" /><br/>
-    <input type="text" id="rollNo" placeholder="Roll number" /><br/>
-    <video id="video" width="320" height="240" autoplay muted></video>
-    <p id="statusMsg"></p>
-    <button id="startCaptureBtn">Start Capture</button>
-    <button id="uploadCaptureBtn" disabled>Upload Images</button>
-    <button onclick="closeCapture()">Cancel</button>
-  </div>
-</div>
-
-<script>
-let video = document.getElementById('video');
-let stream = null;
-let capturedImages = [];
-let capturing = false;
-
-function showCapture() {
-  document.getElementById('captureModal').style.display = 'flex';
-}
-
-function closeCapture() {
-  document.getElementById('captureModal').style.display = 'none';
-  capturedImages = [];
-  capturing = false;
-  document.getElementById('statusMsg').innerText = '';
-  document.getElementById('uploadCaptureBtn').disabled = true;
-  if (stream) {
-    stream.getTracks().forEach(track => track.stop());
-    stream = null;
-  }
-}
-
-document.getElementById('startCaptureBtn').onclick = async () => {
-  let className = document.getElementById('className').value.trim();
-  let rollNo = document.getElementById('rollNo').value.trim();
-  if(!className || !rollNo) { alert('Please enter Class and Roll Number'); return; }
-  if(capturing) return;
-
-  if(!stream) {
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({video:true});
-      video.srcObject = stream;
-    } catch(e) {
-      alert('Cannot access webcam');
-      return;
-    }
-  }
-
-  capturing = true;
-  capturedImages = [];
-  document.getElementById('statusMsg').innerText = 'Capturing 20 images...';
-
-  let count = 0;
-  let interval = setInterval(() => {
-    if(count >= 20){
-      clearInterval(interval);
-      document.getElementById('statusMsg').innerText = 'Captured 20 images';
-      capturing = false;
-      document.getElementById('uploadCaptureBtn').disabled = false;
-      return;
-    }
-    let canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth || 320;
-    canvas.height = video.videoHeight || 240;
-    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-    let dataURL = canvas.toDataURL('image/jpeg');
-    capturedImages.push(dataURL);
-    count++;
-  }, 200);
-};
-
-document.getElementById('uploadCaptureBtn').onclick = async () => {
-  let className = document.getElementById('className').value.trim();
-  let rollNo = document.getElementById('rollNo').value.trim();
-  if(capturedImages.length === 0) {
-    alert('No images captured');
-    return;
-  }
-  let formData = new FormData();
-  formData.append('class_name', className);
-  formData.append('roll_no', rollNo);
-  capturedImages.forEach(img => formData.append('images', img));
-
-  try {
-    let res = await fetch('/capture_face', { method: 'POST', body: formData });
-    if(res.redirected) {
-      window.location.href = res.url;
-    } else {
-      alert('Upload complete but no redirect');
-    }
-  } catch(e) {
-    alert('Upload failed: ' + e.message);
-  }
-}
-</script>
-</body>
-</html>
-'''
-
-ADD_STUDENT_HTML = '''
+modern_frontend = """
 <!DOCTYPE html>
-<html><head><title>Add Student</title>
-<style>
-body {font-family: Arial; background:#eef;}
-.container {width:400px;margin:50px auto;background:#fff;padding:20px;border-radius:10px;box-shadow:0 0 15px #aaa;}
-h2 {text-align:center; margin-bottom: 20px;}
-input,button {width:100%; padding:10px; margin:10px 0; border-radius:6px; border:1px solid #ccc;}
-button {background:#2874f0; color:white; font-weight:bold; border:none; cursor:pointer;}
-button:hover {background:#124f91;}
-.message {color:green; text-align:center;}
-.error {color:red; text-align:center;}
-</style>
-</head><body>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>EduAttend Pro – Automated Attendance for Schools</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        html,body{margin:0;padding:0;font-family:'Segoe UI',Arial,sans-serif;}
+        body{background:#f4f4f6;}
+        .container{max-width:900px;margin:50px auto;}
+        .card{background:#fff;border-radius:16px;box-shadow:0 6px 24px rgba(50,50,93,.09);padding:32px;}
+        /* Hero */
+        .hero{display:flex;flex-wrap:wrap;align-items:center;gap:32px;margin-bottom:32px;}
+        .hero-text{flex:1}
+        .hero-title{font-size:2.7rem;font-weight:700;line-height:1.15;margin-bottom:18px;}
+        .hero-gradient{background:linear-gradient(94deg,#2176bf,#27c1a3,#fd7646);-webkit-background-clip:text;color:transparent;}
+        .hero-desc{color:#334155;font-size:1.16rem;}
+        .hero-actions{margin:32px 0 0;display:flex;gap:12px;flex-wrap:wrap;}
+        .hero-image{flex:1;display:flex;align-items:center;justify-content:center;}
+        .hero-image img{width:320px;max-width:100%;border-radius:12px;box-shadow:0 1px 20px rgba(33,118,191,.08);}
+        /* Tabs/forms */
+        .tab-navs{display:flex;gap:0;}
+        .tab-btn{flex:1;padding:13px;font-weight:600;font-size:1.04rem;border:none;border-bottom:3px solid transparent;background:none;cursor:pointer;}
+        .tab-btn.active{border-color:#2176bf;color:#2176bf;}
+        .form-card{padding:20px 0 0}
+        form{display:flex;flex-direction:column;gap:18px;}
+        input[type='text'],input[type='password'],input[type='file']{
+            padding:10px 12px;font-size:1rem;border:1.4px solid #d0d7de;border-radius:7px;}
+        button[type='submit']{background:#2176bf;color:#fff;border:none;border-radius:8px;padding:12px 0;margin-top:8px;font-size:1.12rem;cursor:pointer;font-weight:600;}
+        button[type='submit']:hover{background:#185c97;}
+        .message{font-size:.98rem;}
+        .message.error{color:#c62828;}
+        .message.success{color:#27a466;}
+        /* Dashboard */
+        .dashboard{max-width:520px;margin:42px auto;}
+        .dashboard label{color:#444;font-size:1.02rem;margin-bottom:2px;display:block;}
+        .dash-box{background:#f4f8fb;padding:16px 20px;border-radius:10px;margin-bottom:22px;}
+        .dash-links a{margin-right:16px;color:#2176bf;font-weight:500;text-decoration:none;}
+    </style>
+    <script>
+        function switchTab(tab){
+            document.getElementById('loginTabBtn').classList.remove('active');
+            document.getElementById('registerTabBtn').classList.remove('active');
+            document.getElementById('loginFrm').style.display='none';
+            document.getElementById('registerFrm').style.display='none';
+            if(tab=='login'){
+                document.getElementById('loginTabBtn').classList.add('active');
+                document.getElementById('loginFrm').style.display='block';
+            }else{
+                document.getElementById('registerTabBtn').classList.add('active');
+                document.getElementById('registerFrm').style.display='block';
+            }
+        }
+    </script>
+</head>
+<body>
 <div class="container">
-<h2>Add Student</h2>
-{% if message %}
-  <p class="message">{{ message }}</p>
-{% endif %}
-{% if error %}
-  <p class="error">{{ error }}</p>
-{% endif %}
-<form method="POST">
-  <input name="class_name" placeholder="Class Name" required/>
-  <input name="name" placeholder="Student Name" required/>
-  <input type="number" name="roll_no" placeholder="Roll Number" required/>
-  <input name="fathers_name" placeholder="Father's Name"/>
-  <input name="contact" placeholder="Contact"/>
-  <button type="submit">Add Student</button>
-</form>
-<p><a href="{{ url_for('dashboard') }}">Back to Dashboard</a></p>
+    <div class="card">
+        <div class="hero">
+            <div class="hero-text">
+                <div class="hero-title"><span class="hero-gradient">EduAttend Pro</span></div>
+                <div class="hero-desc">
+                    Next-gen, offline-ready <b>automated attendance system</b> for rural schools.<br>
+                    Secure, fast, simple – streamline school management and empower teachers.
+                </div>
+                <div class="hero-actions">
+                    <button class="tab-btn active" id="loginTabBtn" onclick="switchTab('login')">Login</button>
+                    <button class="tab-btn" id="registerTabBtn" onclick="switchTab('register')">Register</button>
+                </div>
+            </div>
+            <div class="hero-image">
+                <img src="https://images.unsplash.com/photo-1497486751825-1233686d5d80?ixlib=rb-4.0.3&auto=format&fit=crop&w=600&q=80" alt="Attendance">
+            </div>
+        </div>
+        <div class="form-card">
+        {% with messages = get_flashed_messages(category_filter=['success']) %}
+            {% if messages %}<div class="message success">{{ messages[0] }}</div>{% endif %}
+        {% endwith %}
+            {% if login_error %}<div class="message error">{{ login_error }}</div>{% endif %}
+            {% if register_error %}<div class="message error">{{ register_error }}</div>{% endif %}
+            <!-- Login form -->
+            <form method="post" id="loginFrm" style="display:block;">
+                <input type="hidden" name="form_type" value="login">
+                <input type="text" name="username" placeholder="Username" required>
+                <input type="password" name="password" placeholder="Password" required>
+                <button type="submit">Login</button>
+            </form>
+            <!-- Register form -->
+            <form method="post" id="registerFrm" style="display:none;" enctype="multipart/form-data">
+                <input type="hidden" name="form_type" value="register">
+                <input type="text" name="username" placeholder="Username" required>
+                <input type="password" name="password" placeholder="Password" required>
+                <input type="password" name="password2" placeholder="Confirm Password" required>
+                <input type="file" name="workbook" accept=".xlsx" required>
+                <button type="submit">Register</button>
+            </form>
+        </div>
+    </div>
+    {% if session['user_id'] %}
+    <div class="dashboard card">
+        <h2>Hello, {{ session['username'] }}</h2>
+        <div class="dash-box">
+            <label>Workbook:</label>
+            {% if session['workbook_path'] and os.path.exists(session['workbook_path']) %}
+                <b>{{ session['workbook_path'].split('/')[-1] }}</b>
+            {% else %}
+                <span>No workbook uploaded.</span>
+            {% endif %}
+        </div>
+        <div class="dash-links">
+            <a href="{{ url_for('download_workbook') }}">Download Workbook</a>
+            <a href="{{ url_for('add_student') }}">Add Student</a>
+            <a href="{{ url_for('logout') }}">Logout</a>
+        </div>
+    </div>
+    {% endif %}
 </div>
-</body></html>
-'''
+<script>
+    // On page load, show login tab if no errors in registration
+    {% if register_error %}switchTab('register');{% endif %}
+</script>
+</body>
+</html>
+"""
 
-# Routes
+add_student_html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Add Student - EduAttend Pro</title>
+    <style>
+    body{font-family:'Segoe UI',Arial,sans-serif;background:#f9fbfc;}
+    .container{max-width:470px;margin:60px auto;}
+    .card{background:#fff;padding:30px;border-radius:10px;box-shadow:0 2px 18px rgba(33,118,191,.10);}
+    .title{font-size:1.44rem;font-weight:600;margin-bottom:26px;text-align:center;}
+    label{display:block;margin-bottom:6px;color:#222;}
+    input{width:100%;padding:9px;margin-bottom:11px;border:1.2px solid #d1d5db;border-radius:6px;}
+    button{background:#2176bf;color:#fff;border:none;border-radius:6px;padding:11px 0;width:100%;font-size:1.13rem;font-weight:600;}
+    button:hover{background:#185c97;}
+    .msg{margin:12px 0 0;font-size:1.01rem;color:green;}
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="card">
+        <div class="title">Add Student</div>
+        {% if message %}
+        <div class="msg">{{ message }}</div>
+        {% endif %}
+        {% if error %}
+        <div class="msg" style="color:red">{{ error }}</div>
+        {% endif %}
+        <form method="post">
+            <label>Class Name:</label>
+            <input type="text" name="class_name" required>
+            <label>Student Name:</label>
+            <input type="text" name="name" required>
+            <label>Roll Number:</label>
+            <input type="number" name="roll_no" required>
+            <label>Father's Name:</label>
+            <input type="text" name="fathers_name">
+            <label>Contact:</label>
+            <input type="text" name="contact">
+            <button type="submit">Add Student</button>
+        </form>
+        <br>
+        <a href="{{ url_for('dashboard') }}">Back to Dashboard</a>
+    </div>
+</div>
+</body>
+</html>
+"""
 
-@app.route('/', methods=['GET','POST'])
+@app.route('/', methods=['GET', 'POST'])
 def home():
-    error = None
-    success = None
+    login_error = None
+    register_error = None
     if request.method == 'POST':
-        action = request.form.get('action')
-        username = request.form.get('username','').strip()
-        password = request.form.get('password')
-        if action == 'login':
+        form_type = request.form.get('form_type')
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').strip()
+        if form_type == 'login':
             user = User.query.filter_by(username=username).first()
             if user and user.check_password(password):
                 session['user_id'] = user.id
                 session['username'] = user.username
                 session['workbook_path'] = user.workbook_path
+                session['role'] = user.role
                 return redirect(url_for('dashboard'))
-            error = 'Invalid username or password'
-        elif action == 'register':
-            password2 = request.form.get('password2')
-            workbook = request.files.get('workbook')
-            if password != password2:
-                error = 'Passwords do not match'
-            elif User.query.filter_by(username=username).first():
-                error = 'Username already taken'
-            elif not workbook or not workbook.filename.endswith('.xlsx'):
-                error = 'Upload valid Excel workbook (.xlsx)'
             else:
-                userfolder = os.path.join(app.config['UPLOAD_FOLDER'], username)
-                os.makedirs(userfolder, exist_ok=True)
-                filepath = os.path.join(userfolder, workbook.filename)
-                workbook.save(filepath)
-                user = User(username=username, workbook_path=filepath)
-                user.set_password(password)
-                db.session.add(user)
-                db.session.commit()
-                success = 'Registration successful. Please login.'
-    return render_template_string(HOME_HTML, error_msg=error, success_msg=success)
+                login_error = 'Invalid username or password.'
+        elif form_type == 'register':
+            password2 = request.form.get('password2', '').strip()
+            if password != password2:
+                register_error = 'Passwords do not match.'
+            elif User.query.filter_by(username=username).first():
+                register_error = 'Username already exists!'
+            else:
+                workbook = request.files.get('workbook')
+                if not workbook or not workbook.filename.endswith('.xlsx'):
+                    register_error = "Please upload a valid Excel (.xlsx) workbook."
+                else:
+                    safe_filename = secure_filename(workbook.filename)
+                    user_folder = os.path.join(app.config['UPLOAD_FOLDER'], username)
+                    os.makedirs(user_folder, exist_ok=True)
+                    workbook_path = os.path.join(user_folder, safe_filename)
+                    workbook.save(workbook_path)
+                    user = User(username=username, role='user', workbook_path=workbook_path)
+                    user.set_password(password)
+                    db.session.add(user)
+                    db.session.commit()
+                    flash('Registration successful! Please log in.', "success")
+                    return redirect(url_for('home'))
+    return render_template_string(modern_frontend, login_error=login_error, register_error=register_error, os=os, session=session)
 
 @app.route('/dashboard')
 def dashboard():
-    if 'user_id' not in session: return redirect(url_for('home'))
-    username = session['username']
-    workpath = session.get('workbook_path')
-    wbname = os.path.basename(workpath) if workpath and os.path.exists(workpath) else "No workbook uploaded"
-    return render_template_string(DASHBOARD_HTML, username=username, workbook=wbname)
+    if not session.get('user_id'):
+        return redirect(url_for('home'))
+    # This just redisplays the home (with dashboard card shown)
+    return redirect(url_for('home'))
 
 @app.route('/download_workbook')
 def download_workbook():
-    if 'user_id' not in session: return redirect(url_for('home'))
+    if 'user_id' not in session:
+        return redirect(url_for('home'))
     path = session.get('workbook_path')
     if path and os.path.exists(path):
         return send_file(path, as_attachment=True)
     return abort(404)
 
-@app.route('/add_student', methods=['GET','POST'])
+@app.route('/add_student', methods=['GET', 'POST'])
 def add_student():
-    if 'user_id' not in session: return redirect(url_for('home'))
-    error = None
+    if 'user_id' not in session:
+        return redirect(url_for('home'))
     message = None
+    error = None
     if request.method == 'POST':
-        class_name = request.form.get('class_name')
+        class_sheet = request.form.get('class_name')
         name = request.form.get('name')
         roll_no = request.form.get('roll_no')
-        father = request.form.get('fathers_name')
+        fathers_name = request.form.get('fathers_name')
         contact = request.form.get('contact')
-        if not class_name or not name or not roll_no:
-            error = 'Please fill required fields'
+
+        if not all([class_sheet, name, roll_no]):
+            error = "Please fill all required fields (Class, Name, Roll No)."
         else:
             try:
-                roll_int = int(roll_no)
-                workbook = session.get('workbook_path')
-                if not workbook or not os.path.exists(workbook):
-                    error = 'Workbook missing'
-                else:
-                    xl = pd.ExcelFile(workbook)
-                    dfs = {sheet: xl.parse(sheet) for sheet in xl.sheet_names}
-                    if class_name in dfs:
-                        df = dfs[class_name]
-                    else:
-                        df = pd.DataFrame(columns=["S.No", "Name", "Roll Number", "Father's Name", "Contact"])
-                    if str(roll_int) in df["Roll Number"].astype(str).values:
-                        error = 'Roll number already exists'
-                    else:
-                        new_row = {"S.No": len(df)+1, "Name": name, "Roll Number": roll_int, "Father's Name": father or "", "Contact": contact or ""}
-                        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-                        dfs[class_name] = df
-                        with pd.ExcelWriter(workbook, engine='openpyxl') as writer:
-                            for sheet, data in dfs.items():
-                                data.to_excel(writer, sheet_name=sheet, index=False)
-                        message = 'Student added successfully'
-            except Exception as e:
-                error = str(e)
-    return render_template_string(ADD_STUDENT_HTML, error=error, message=message)
-
-@app.route('/capture_face', methods=['POST'])
-def capture_face():
-    if 'user_id' not in session:
-        flash('Login required', 'error')
-        return redirect(url_for('home'))
-    cls = request.form.get('class_name')
-    roll_no = request.form.get('roll_no')
-    images = request.form.getlist('images')
-    if not cls or not roll_no or not images:
-        flash('Incomplete capture data', 'error')
-        return redirect(url_for('dashboard'))
-    save_face_images(cls, roll_no, images)
-    flash('Face images uploaded successfully.', 'success')
-    return redirect(url_for('dashboard'))
-
-@app.route('/train_model', methods=['POST'])
-def train_model():
-    if 'user_id' not in session:
-        flash('Login required', 'error')
-        return redirect(url_for('home'))
-    success, msg = train_and_save_model()
-    flash(msg, 'success' if success else 'error')
-    return redirect(url_for('dashboard'))
-
-@app.route('/mark_attendance')
-def mark_attendance():
-    if 'user_id' not in session:
-        flash('Please login to access attendance', 'error')
-        return redirect(url_for('home'))
-
-    if not os.path.exists(app.config['MODEL_PATH']):
-        flash('No trained model found. Please train the model first.', 'error')
-        return redirect(url_for('dashboard'))
-
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
-    recognizer.read(app.config['MODEL_PATH'])
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-
-    workbook = session.get('workbook_path')
-    if not workbook or not os.path.exists(workbook):
-        flash('Attendance workbook not found', 'error')
-        return redirect(url_for('dashboard'))
-
-    xl = pd.ExcelFile(workbook)
-    sheets = xl.sheet_names
-
-    today_str = datetime.datetime.now().strftime('%d-%m-%Y')
-
-    faces, labels, label_map = load_face_data()
-    if not faces:
-        flash('No face data available. Please capture face images and train the model.', 'error')
-        return redirect(url_for('dashboard'))
-
-    inv_label_map = {v: k for k, v in label_map.items()}
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        flash('Could not open webcam', 'error')
-        return redirect(url_for('dashboard'))
-
-    attendance_marked = False
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces_detected = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-
-        for (x, y, w, h) in faces_detected:
-            face_roi = gray[y:y+h, x:x+w]
-            face_roi = cv2.resize(face_roi, (200, 200))
-
-            label, confidence = recognizer.predict(face_roi)
-            print(f"DEBUG: Predicted label {label}, confidence {confidence}")
-
-            # Increase threshold to accept less confident matches (adjust experimentally)
-            threshold = 150
-
-            if confidence < threshold and label in inv_label_map:
-                student_key = inv_label_map[label]
-                print(f"DEBUG: Recognized student key: {student_key}")
-
-                if student_key is None:
-                    text = "Recognition mismatch"
-                    color = (0, 0, 255)
-                    print("DEBUG: Student key not found in mapping")
+                roll_no_int = int(roll_no)
+            except ValueError:
+                error = "Roll No must be an integer."
+            if not error:
+                workbook_path = session.get('workbook_path')
+                if not workbook_path or not os.path.exists(workbook_path):
+                    error = "Workbook file not found. Please upload again."
                 else:
                     try:
-                        class_name, roll_no = student_key.split('-')
-                    except Exception as e:
-                        text = "Label format error"
-                        color = (0, 0, 255)
-                        print(f"DEBUG: Label split error: {e}")
-                        break
-
-                    if class_name in sheets:
-                        df = xl.parse(class_name)
-                        df.columns = df.columns.str.strip()
-
-                        if today_str not in df.columns:
-                            df[today_str] = ""
-
-                        matched_rows = df.index[df['Roll Number'].astype(str) == roll_no].tolist()
-
-                        if matched_rows:
-                            idx = matched_rows[0]
-                            df.at[idx, today_str] = 'P'
-
-                            # Save updated sheet replacing old content
-                            with pd.ExcelWriter(workbook, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
-                                df.to_excel(writer, sheet_name=class_name, index=False)
-
-                            attendance_marked = True
-                            text = f'Present: {roll_no}'
-                            color = (0, 255, 0)
-                            print(f"DEBUG: Successfully marked attendance for roll {roll_no} in class {class_name}")
+                        xls = pd.ExcelFile(workbook_path)
+                        if class_sheet in xls.sheet_names:
+                            df = pd.read_excel(xls, sheet_name=class_sheet, engine='openpyxl')
                         else:
-                            text = 'Roll number not found'
-                            color = (0, 165, 255)
-                            print(f"DEBUG: Roll number {roll_no} not found in sheet {class_name}")
-                    else:
-                        text = 'Class sheet missing'
-                        color = (0, 0, 255)
-                        print(f"DEBUG: Class sheet {class_name} missing in workbook")
-            else:
-                text = 'Unknown'
-                color = (0, 0, 255)
-                print(f"DEBUG: Face not recognized or confidence {confidence} too high")
-
-            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-            cv2.putText(frame, text, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-            break  # Only process first face per frame to avoid multi-detection confusion
-
-        cv2.imshow('Mark Attendance - Press q to exit', frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-
-        if attendance_marked:
-            cv2.waitKey(2000)  # Pause 2 seconds to show marked attendance
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-    if attendance_marked:
-        flash('Attendance marked successfully!', 'success')
-    else:
-        flash('No attendance marked.', 'warning')
-
-    return redirect(url_for('dashboard'))
-
-
+                            df = pd.DataFrame(columns=["S.No.", "Name", "Roll No.", "Father's Name", "Contact"])
+                        if roll_no_int in df["Roll No."].values:
+                            error = f"Roll No {roll_no_int} already exists in class {class_sheet}."
+                        else:
+                            next_s_no = int(df["S.No."].max()) + 1 if not df.empty else 1
+                            new_row = {"S.No.": next_s_no, "Name": name, "Roll No.": roll_no_int,
+                                       "Father's Name": fathers_name, "Contact": contact}
+                            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                            all_sheets = {sheet: pd.read_excel(xls, sheet_name=sheet, engine='openpyxl') for sheet in xls.sheet_names}
+                            all_sheets[class_sheet] = df
+                            with pd.ExcelWriter(workbook_path, engine='openpyxl') as writer:
+                                for sheet_name, sheet_df in all_sheets.items():
+                                    sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                            message = f"Student {name} added to class {class_sheet} successfully!"
+                    except Exception as e:
+                        error = f"Error updating workbook: {e}"
+    return render_template_string(add_student_html, message=message, error=error)
 
 @app.route('/logout')
 def logout():
     session.clear()
     return redirect(url_for('home'))
-
 
 if __name__ == '__main__':
     app.run(debug=True)
